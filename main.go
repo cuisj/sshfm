@@ -3,14 +3,18 @@ package main
 import (
 	"fmt"
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/terminal"
 	"io"
 	"io/ioutil"
 	"log"
 	"net"
 	"os"
 	"path"
-	//"golang.org/x/crypto/ssh/terminal"
 )
+
+func init() {
+	//log.SetFlags(log.LstdFlags | log.Lshortfile)
+}
 
 func main() {
 	log.Println("Fortress Machine")
@@ -77,7 +81,7 @@ type Proxy struct {
 func (p *Proxy) handle() {
 	defer p.serverConn.Wait()
 
-	log.Printf("connection: [%s] [%s]\n", p.serverConn.RemoteAddr(), p.serverConn.User())
+	log.Printf("[%s] from [%s]\n", p.serverConn.User(), p.serverConn.RemoteAddr())
 
 	// 忽略全局请求
 	go ssh.DiscardRequests(p.requestChan)
@@ -130,8 +134,8 @@ func (p *Proxy) handle() {
 }
 
 func (p *Proxy) handleChannel() {
-	defer p.session.Close()
 	defer p.channel.Close()
+	defer p.session.Close()
 
 	go func() {
 		for request := range p.request {
@@ -150,25 +154,50 @@ func (p *Proxy) handleChannel() {
 	stderr, _ := p.session.StderrPipe()
 	stdin, _ := p.session.StdinPipe()
 
-	go io.Copy(stdin, p.channel)
-	go io.Copy(p.channel, stdout)
-	io.Copy(p.channel, stderr)
+	r, w := io.Pipe()
+	defer w.Close()
+	defer r.Close()
 
-	/*term := terminal.NewTerminal(p.channel, "fm> ")
+	mw := io.MultiWriter(stdin, w)
+
+	go io.Copy(mw, p.channel)
+	go io.Copy(p.channel, stdout)
+	go p.audit(r)
+
+	io.Copy(p.channel, stderr)
+}
+
+func (p *Proxy) audit(r io.Reader) {
+	fc := NewFakeChannel(r)
+
+	term := terminal.NewTerminal(fc, "fm> ")
 	for {
 		line, err := term.ReadLine()
 		if err != nil {
-			if err != io.EOF {
+			if err != io.EOF && err != io.ErrClosedPipe {
 				log.Println(err)
 			}
 			break
 		}
 
-		if line != "list" {
-			fmt.Fprintf(term, "You have no permission to execute [%s]\n", line)
-			continue
+		if len(line) > 0 {
+			log.Printf("[%s@%s] %s\n", p.serverConn.User(), p.client.RemoteAddr(), line)
 		}
+	}
+}
 
-		fmt.Fprintln(term, "Just to controll you!")
-	}*/
+type FakeChannel struct {
+	r io.Reader
+}
+
+func NewFakeChannel(r io.Reader) *FakeChannel {
+	return &FakeChannel{r: r}
+}
+
+func (t *FakeChannel) Read(p []byte) (n int, err error) {
+	return t.r.Read(p)
+}
+
+func (t *FakeChannel) Write(p []byte) (n int, err error) {
+	return len(p), nil
 }
