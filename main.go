@@ -55,61 +55,62 @@ func main() {
 			continue
 		}
 
-		serverConn, newChanChan, requestChan, err := ssh.NewServerConn(conn, serverConfig)
+		serverconn, channels, requests, err := ssh.NewServerConn(conn, serverConfig)
 		if err != nil {
 			log.Printf("Handshake failed, %s\n", err)
 			continue
 		}
 
-		p := &Proxy{serverConn: serverConn, newChanChan: newChanChan, requestChan: requestChan}
-		go p.handle()
+		connection := &Connection{serverConn: serverconn,
+					incommingChannels: channels,
+					incommingRequests: requests}
+		go connection.handle()
 	}
 }
 
-type Proxy struct {
+type Connection struct {
 	serverConn  *ssh.ServerConn
-	newChanChan <-chan ssh.NewChannel
-	requestChan <-chan *ssh.Request
-
-	channel ssh.Channel
-	request <-chan *ssh.Request
+	incommingChannels <-chan ssh.NewChannel
+	incommingRequests <-chan *ssh.Request
 
 	client  *ssh.Client
-	session *ssh.Session
 }
 
-func (p *Proxy) handle() {
-	defer p.serverConn.Wait()
+func (c *Connection) handle() {
+	defer c.serverConn.Wait()
 
-	log.Printf("[%s] from [%s]\n", p.serverConn.User(), p.serverConn.RemoteAddr())
+	log.Printf("[%s] from [%s]\n", c.serverConn.User(), c.serverConn.RemoteAddr())
 
 	// 忽略全局请求
-	go ssh.DiscardRequests(p.requestChan)
+	go ssh.DiscardRequests(c.incommingRequests)
 
 	// 连接远程服务端
 	clientConfig := &ssh.ClientConfig{
-		User: p.serverConn.Permissions.Extensions["username"],
+		User: c.serverConn.Permissions.Extensions["username"],
 		Auth: []ssh.AuthMethod{
-			ssh.Password(p.serverConn.Permissions.Extensions["password"]),
+			ssh.Password(c.serverConn.Permissions.Extensions["password"]),
 		},
 
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 	}
 
-	client, err := ssh.Dial("tcp", p.serverConn.Permissions.Extensions["sshserver"], clientConfig)
+	client, err := ssh.Dial("tcp", c.serverConn.Permissions.Extensions["sshserver"], clientConfig)
 	if err != nil {
+		log.Println(err)
 		return
 	}
 	defer client.Close()
 
+	c.client = client
+
 	// 处理通道请求, 我们只处理session请求
-	for newChan := range p.newChanChan {
-		if chanType := newChan.ChannelType(); chanType != "session" {
-			newChan.Reject(ssh.UnknownChannelType, fmt.Sprintf("unknown channel type: %s", chanType))
+	for newchan := range c.incommingChannels {
+		if chanType := newchan.ChannelType(); chanType != "session" {
+			newchan.Reject(ssh.UnknownChannelType, fmt.Sprintf("unknown channel type: %s", chanType))
 			continue
 		}
 
-		ch, req, err := newChan.Accept()
+		channel, requests, err := newchan.Accept()
 		if err != nil {
 			log.Printf("Accept channel failed, %s\n", err)
 			continue
@@ -117,60 +118,67 @@ func (p *Proxy) handle() {
 
 		session, err := client.NewSession()
 		if err != nil {
-			log.Printf("Failed to create session: ", err)
-			return
+			channel.Close()
+			log.Printf("Failed to create session: %s\n", err)
+			continue
 		}
 
-		p.channel = ch
-		p.request = req
-
-		p.client = client
-		p.session = session
-
-		break
+		c.handleChannel(channel, requests, session)
 	}
-
-	p.handleChannel()
 }
 
-func (p *Proxy) handleChannel() {
-	defer p.channel.Close()
-	defer p.session.Close()
+func (c *Connection) handleChannel(channel ssh.Channel, requests <-chan *ssh.Request, session *ssh.Session) {
+	defer channel.Close()
+	defer session.Close()
 
+	// 转发请求
 	go func() {
-		for request := range p.request {
-			result, err := p.session.SendRequest(request.Type, request.WantReply, request.Payload)
+		for request := range requests {
+			success, err := session.SendRequest(request.Type, request.WantReply, request.Payload)
 			if err != nil {
-				log.Printf("Send request failed, %v", err)
+				log.Printf("Send request failed, %s", err)
 			}
 
 			if request.WantReply {
-				request.Reply(result, nil)
+				request.Reply(success, nil)
 			}
 		}
 	}()
 
-	stdout, _ := p.session.StdoutPipe()
-	stderr, _ := p.session.StderrPipe()
-	stdin, _ := p.session.StdinPipe()
+
+	// 转发数据，同时监听数据
+	sessionStdin, err := session.StdinPipe()
+	if err != nil {
+		log.Println(err)
+	}
+
+	sessionStdout, err := session.StdoutPipe()
+	if err != nil {
+		log.Println(err)
+	}
+
+	sessionStderr, err := session.StderrPipe()
+	if err != nil {
+		log.Println(err)
+	}
 
 	r, w := io.Pipe()
-	defer w.Close()
 	defer r.Close()
+	defer w.Close()
 
-	mw := io.MultiWriter(stdin, w)
+	mw := io.MultiWriter(sessionStdin, w)
 
-	go io.Copy(mw, p.channel)
-	go io.Copy(p.channel, stdout)
-	go p.audit(r)
+	go io.Copy(mw, channel)
+	go c.audit(r)
+	go io.Copy(channel, sessionStdout)
 
-	io.Copy(p.channel, stderr)
+	io.Copy(channel, sessionStderr)
 }
 
-func (p *Proxy) audit(r io.Reader) {
-	fc := NewFakeChannel(r)
+func (c *Connection) audit(r io.Reader) {
+	pc := NewPseudoChannel(r)
 
-	term := terminal.NewTerminal(fc, "fm> ")
+	term := terminal.NewTerminal(pc, "")
 	for {
 		line, err := term.ReadLine()
 		if err != nil {
@@ -181,23 +189,25 @@ func (p *Proxy) audit(r io.Reader) {
 		}
 
 		if len(line) > 0 {
-			log.Printf("[%s@%s] %s\n", p.serverConn.User(), p.client.RemoteAddr(), line)
+			log.Printf("[%s@%s] %s\n", c.serverConn.User(), c.client.RemoteAddr(), line)
 		}
 	}
 }
 
-type FakeChannel struct {
+
+type PseudoChannel struct {
 	r io.Reader
 }
 
-func NewFakeChannel(r io.Reader) *FakeChannel {
-	return &FakeChannel{r: r}
+func NewPseudoChannel(r io.Reader) *PseudoChannel {
+	return &PseudoChannel{r: r}
 }
 
-func (t *FakeChannel) Read(p []byte) (n int, err error) {
-	return t.r.Read(p)
+func (c *PseudoChannel) Read(p []byte) (n int, err error) {
+	return c.r.Read(p)
 }
 
-func (t *FakeChannel) Write(p []byte) (n int, err error) {
+func (c *PseudoChannel) Write(p []byte) (n int, err error) {
 	return len(p), nil
 }
+
