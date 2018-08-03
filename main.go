@@ -3,24 +3,24 @@ package main
 import (
 	"fmt"
 	"golang.org/x/crypto/ssh"
-	"golang.org/x/crypto/ssh/terminal"
 	"io"
 	"io/ioutil"
 	"log"
 	"net"
 	"os"
 	"path"
+	"bufio"
 )
 
 func init() {
-	//log.SetFlags(log.LstdFlags | log.Lshortfile)
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
 }
 
 func main() {
 	log.Println("Fortress Machine")
 
-	hostKeyPath := path.Join(os.Getenv("GOPATH"), "bin/config/sshfm")
-
+	hostKeyPath := path.Join(os.Getenv("HOME"), "config/sshfm")
+	log.Println(hostKeyPath)
 	hostKeyBytes, err := ioutil.ReadFile(hostKeyPath)
 	if err != nil {
 		log.Fatalln("Load private key sshfm failed")
@@ -166,48 +166,28 @@ func (c *Connection) handleChannel(channel ssh.Channel, requests <-chan *ssh.Req
 	defer r.Close()
 	defer w.Close()
 
-	mw := io.MultiWriter(sessionStdin, w)
+	go io.Copy(sessionStdin, channel)
+	go io.Copy(channel, sessionStderr)
 
-	go io.Copy(mw, channel)
 	go c.audit(r)
-	go io.Copy(channel, sessionStdout)
-
-	io.Copy(channel, sessionStderr)
+	mw := io.MultiWriter(channel, w)
+	io.Copy(mw, sessionStdout)
 }
 
 func (c *Connection) audit(r io.Reader) {
-	pc := NewPseudoChannel(r)
+	b := bufio.NewReader(r)
 
-	term := terminal.NewTerminal(pc, "")
 	for {
-		line, err := term.ReadLine()
+		line, _, err := b.ReadLine()
 		if err != nil {
 			if err != io.EOF && err != io.ErrClosedPipe {
 				log.Println(err)
 			}
+
 			break
 		}
 
-		if len(line) > 0 {
-			log.Printf("[%s@%s] %s\n", c.serverConn.User(), c.client.RemoteAddr(), line)
-		}
+		log.Printf("[%s@%s] %s\n", c.serverConn.User(), c.client.RemoteAddr(), line)
 	}
-}
-
-
-type PseudoChannel struct {
-	r io.Reader
-}
-
-func NewPseudoChannel(r io.Reader) *PseudoChannel {
-	return &PseudoChannel{r: r}
-}
-
-func (c *PseudoChannel) Read(p []byte) (n int, err error) {
-	return c.r.Read(p)
-}
-
-func (c *PseudoChannel) Write(p []byte) (n int, err error) {
-	return len(p), nil
 }
 
