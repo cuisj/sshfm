@@ -10,6 +10,8 @@ import (
 	"os"
 	"path"
 	"bufio"
+	"strings"
+	"sync"
 )
 
 func init() {
@@ -74,6 +76,9 @@ type Connection struct {
 	incommingRequests <-chan *ssh.Request
 
 	client  *ssh.Client
+
+	mutex sync.Mutex
+	stopAudit bool
 }
 
 func (c *Connection) handle() {
@@ -139,6 +144,21 @@ func (c *Connection) handleChannel(channel ssh.Channel, requests <-chan *ssh.Req
 				log.Printf("Send request failed, %s", err)
 			}
 
+			if (request.Type == "exec") {
+				command := string(request.Payload[4:])
+				if strings.HasPrefix(command, "scp") {
+					c.mutex.Lock()
+					c.stopAudit = true
+					c.mutex.Unlock()
+
+					log.Printf("[%s@%s] %s\n", c.serverConn.User(), c.client.RemoteAddr(), command)
+				} else {
+					c.mutex.Lock()
+					c.stopAudit = false
+					c.mutex.Unlock()
+				}
+			}
+
 			if request.WantReply {
 				request.Reply(success, nil)
 			}
@@ -187,7 +207,11 @@ func (c *Connection) audit(r io.Reader) {
 			break
 		}
 
-		log.Printf("[%s@%s] %s\n", c.serverConn.User(), c.client.RemoteAddr(), line)
+		c.mutex.Lock()
+		if !c.stopAudit {
+			log.Printf("[%s@%s] %s\n", c.serverConn.User(), c.client.RemoteAddr(), line)
+		}
+		c.mutex.Unlock()
 	}
 }
 
